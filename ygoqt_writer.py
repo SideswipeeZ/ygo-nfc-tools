@@ -5,13 +5,14 @@ import json
 import sqlite3
 import unicodedata
 import time
+import socket
 
 from urllib.parse import quote_plus
 
 from smartcard.System import readers
 
 from PySide6 import QtWidgets, QtGui, QtCore
-from PySide6.QtCore import QUrl, QEventLoop, QFile, Signal, QObject, QThread, Qt, QPoint
+from PySide6.QtCore import QUrl, QEventLoop, QFile, Signal, QObject, QThread, Qt, QPoint, QSettings, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -412,7 +413,7 @@ class YGOWriter(QMainWindow):
         loader = QUiLoader()
         self.mw = loader.load(ui_file)
         self.setCentralWidget(self.mw)
-        self.appversion = "0.2.0"
+        self.appversion = "0.2.4"
         self.setWindowTitle(f"YGO NFC Tools: {self.appversion} by SideswipeeZ")
         self.ico = QtGui.QIcon(os.path.join(self.getRootPath(), "assets", "icon.png"))
         self.setWindowIcon(self.ico)
@@ -433,6 +434,18 @@ class YGOWriter(QMainWindow):
         self.set_editions()
         self.nfc_status = 0
         self.current_card_urls = []
+        self.server_host = "localhost"
+        self.server_port = 41114
+
+        # Initialize QSettings
+        self.settings = QSettings("SideswipeeZ", "ygo_writer")
+
+        # Load the saved value for the spinbox, defaulting to 1.0 if not set.
+        saved_spinbox_value = self.settings.value("dspin_delay_value", 1.0, type=float)
+        self.mw.dspin_delay.setValue(saved_spinbox_value)
+
+        # Connect the valueChanged signal to the save slot.
+        self.mw.dspin_delay.valueChanged.connect(self.save_dspin_delay_value)
 
         # Setup Pixmaps
         self.default_card_pixmap = QPixmap(os.path.join(self.getRootPath(), "assets", "blank_card_previewsized.png"))
@@ -451,6 +464,8 @@ class YGOWriter(QMainWindow):
         self.mw.bttn_write.clicked.connect(self.on_write_button_clicked)
         self.mw.bttn_launch_ygoprodeck.clicked.connect(lambda: self.launch_link(0))
         self.mw.bttn_launch_yugipedia.clicked.connect(lambda: self.launch_link(1))
+        self.mw.bttn_send_card.clicked.connect(self.send_string)
+        self.mw.bttn_send_removed.clicked.connect(lambda: self.send_string("Removed"))
 
         # Connect Combo Boxes
         # parse_ygo_nfc_encode
@@ -499,8 +514,9 @@ class YGOWriter(QMainWindow):
         # Connect button to the read_tag function
         self.mw.bttn_readtag.clicked.connect(self.start_read_tag)
 
-        # Set the default style (using a light pink theme)
-        self.changeStyle(0)
+        # Load and apply the saved theme index; default to 0 if not set.
+        saved_theme_index = self.settings.value("theme_index", 0, type=int)
+        self.changeStyle(saved_theme_index)
 
         # Debug SSL support information
         self.console_out(("SSL Supported:", QSslSocket.supportsSsl()))
@@ -533,6 +549,54 @@ class YGOWriter(QMainWindow):
                 return os.getcwd()
         except AttributeError:
             return os.getcwd()
+
+    def send_string(self, flag):
+        """Send a command string from the line edit to the NFCServer app."""
+        command_string = self.mw.le_finalstring.text().strip() + "XX"
+
+        if not command_string and flag != "Removed":
+            self.console_out("Error: No Card is Selected.")
+            return
+
+        host = self.mw.le_debug_host.text().strip() or self.server_host
+        port_text = self.mw.le_debug_port.text().strip() or self.server_port
+        port = int(port_text)
+
+        if flag and flag == "Removed":
+            command_string = "RemovedTag"
+        else:
+            if self.mw.chk_sendtagremoved.isChecked():
+                # Get Delay from Double Spinbox (in seconds)
+                delay = self.mw.dspin_delay.value()
+                # Send "RemovedTag" first
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.connect((host, port))
+                        s.sendall("RemovedTag".encode('utf-8'))
+                    self.console_out("Success: Removed tag sent successfully!")
+                    # Use QTimer.singleShot to delay sending the actual command
+                    QTimer.singleShot(int(delay * 1000), lambda: self.send_actual_command(command_string, host, port))
+                    return  # Exit the function; the command will be sent later.
+                except Exception as e:
+                    self.console_out(f"Connection Error: Failed to send RemovedTag: {e}")
+                    return
+
+        # If not using the delayed "RemovedTag" path, send the command immediately.
+        self.send_actual_command(command_string, host, port)
+
+    def send_actual_command(self, command_string, host, port):
+        """Send the actual command string to the server."""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect((host, port))
+                s.sendall(command_string.encode('utf-8'))
+            self.console_out("Success: Card Data sent successfully!")
+        except Exception as e:
+            self.console_out(f"Connection Error: Failed to send Card: {e}")
+
+    def save_dspin_delay_value(self, value):
+        """Save the current value of the doublespinbox to QSettings."""
+        self.settings.setValue("dspin_delay_value", value)
 
     def console_out(self, message):
         """Update the console label with a new message."""
@@ -583,6 +647,8 @@ class YGOWriter(QMainWindow):
         self.console_out(f"Database initialized at: {db_path}")
 
     def changeStyle(self, indx):
+        self.settings.setValue("theme_index", indx)
+
         if indx == 0:
             theme = "light_pink.xml"
             apply_stylesheet(self, theme='light_pink.xml', invert_secondary=(
